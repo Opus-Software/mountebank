@@ -144,11 +144,25 @@ function loadConfig (options, server) {
             filename: options.configfile,
             stringify: stringify,
             inject: stringify // backwards compatibility
-        }),
-        json = JSON.parse(parsedContents),
-        // [json] Assume they left off the outer imposters array
-        imposters = json.imposters || [json];
-
+        });
+    let json;
+    try {
+        json = JSON.parse(parsedContents);
+    }
+    catch (e) {
+        if (e instanceof SyntaxError) {
+            const errorPosition = parseInt(e.message.split('position ')[1]);
+            const errorFile = `${parsedContents.substring(0, errorPosition)}>>>>>>${parsedContents.substring(errorPosition)}`;
+            fs.writeFileSync('configfileError.err', errorFile);
+            throw Error(`JSON parser found a syntax error on the configuration file at position ${errorPosition}.\n` +
+            'Look for the >>>>>> occurrence on the configfileError.err file for a more precise location.');
+        }
+        else {
+            throw e;
+        }
+    }
+    // [json] Assume they left off the imposters array
+    const imposters = json.imposters || [json];
     return putConfig(options, JSON.stringify({ imposters: imposters }));
 }
 
