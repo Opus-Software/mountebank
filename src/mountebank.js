@@ -326,6 +326,19 @@ function create (options) {
                         Object.keys(connections).forEach(socket => {
                             connections[socket].destroy();
                         });
+                    },
+                    log: (type, message) => {
+                        switch (type) {
+                            case 'info':
+                                logger.info(message);
+                                break;
+                            case 'warn':
+                                logger.warn(message);
+                                break;
+                            case 'error':
+                                logger.error(message);
+                                break;
+                        }
                     }
                 });
             });

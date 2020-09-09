@@ -136,7 +136,7 @@ function getContentsOrExit (file, server) {
 var CONFIG_FILE_PATH = null;
 function loadConfig (options, server) {
     if (!shouldLoadConfigFile(options)) {
-        return Q(true);
+        return Q(server);
     }
     CONFIG_FILE_PATH = options.configfile;
     const configContents = getContentsOrExit(options.configfile, server),
@@ -149,7 +149,157 @@ function loadConfig (options, server) {
         // [json] Assume they left off the outer imposters array
         imposters = json.imposters || [json];
 
-    return putConfig(options, JSON.stringify({ imposters: imposters }));
+    return putConfig(options, JSON.stringify({ imposters: imposters })).then(() => {
+        return Q(server);
+    });
+}
+
+// Build the predicate path string for the given route, replacing
+// variables inside {} with regex expressions
+function buildPredicatePath (route, basepath, params) {
+    if (basepath === '/' || basepath === undefined) {
+        basepath = '';
+    }
+    if (route.includes('{')) {
+        let predicatePath = route;
+        const matches = [...route.matchAll(/{(.*?)}/g)];
+        matches.forEach(fieldName => {
+            params.forEach(item => {
+                if (item.name === fieldName[1]) {
+                    switch (item.type || item.schema.type) {
+                        case 'integer':
+                            predicatePath = predicatePath.replace(`{${fieldName[1]}}`, '\\d+');
+                            break;
+                        case 'string':
+                            predicatePath = predicatePath.replace(`{${fieldName[1]}}`, '[0-9a-zA-Z-_.~!*\'();:@&=+$\\[\\],?%#]+');
+                            break;
+                        default:
+                            predicatePath = predicatePath.replace(`{${fieldName[1]}}`, '.*');
+                            break;
+                    }
+                }
+            });
+        });
+        return basepath + predicatePath;
+    }
+    else {
+        return basepath + route;
+    }
+}
+
+// Function that generates a default example according to the entry's type
+function getExampleGivenType (type) {
+    switch (type) {
+        case 'string':
+            return '?';
+        case 'boolean':
+            return false;
+        case 'null':
+            return null;
+        case 'dateTime':
+            return '0000-00-00T00:00:00';
+        case 'date':
+            return '0000-00-00';
+        case 'time':
+            return '00:00:00';
+        default:
+            return 0;
+    }
+}
+
+// Recursive function that builds the response body object iterating through
+// the response properties object
+function treatProperty (propertyObject) {
+    if (propertyObject === undefined) {
+        return '?';
+    }
+    const returnObject = {};
+    switch (propertyObject.type) {
+        case 'array':
+            return treatProperty(propertyObject.items);
+        case 'object' || undefined:
+            for (let obj in propertyObject.properties) {
+                returnObject[obj] = treatProperty(propertyObject.properties[obj]);
+            }
+            return returnObject;
+        default:
+            return getExampleGivenType(propertyObject.type);
+    }
+}
+
+// Function that builds the imposter response from the openapi response object
+function buildResponse (respObj, code, statCode) {
+    let body, content;
+    if (respObj.responses[code].content !== undefined) {
+        content = Object.keys(respObj.responses[code].content)[0];
+        body = treatProperty(respObj.responses[code].content[content].schema);
+    }
+    else {
+        body = treatProperty(respObj.responses[code].schema);
+    }
+    const response = {
+        is: {
+            headers: {
+                'Content-Type': respObj.produces || content || '?'
+            },
+            statusCode: statCode,
+            body: body
+        }
+    };
+    return response;
+}
+
+/**
+ * Creates the stubs structures from the openapi parsed object
+ * @param {Object} api - The parsed and validated openapi object
+ * @returns {Array} stubs - The constructed openapi stubs array
+ */
+function buildStubsStruct (api) {
+    const stubs = [];
+    for (const route in api.paths) {
+        for (const verb in api.paths[route]) {
+            const predicate = [
+                { equals: { method: verb.toUpperCase() } },
+                { matches: { path: buildPredicatePath(route, api.basePath, api.paths[route][verb].parameters) } }
+            ];
+            const response = [];
+            for (const code in api.paths[route][verb].responses) {
+                const statCode = code === 'default' ? 200 : parseInt(code);
+                response.push(buildResponse(api.paths[route][verb], code, statCode));
+            }
+            stubs.push({ responses: response, predicates: predicate });
+        }
+    }
+    return stubs;
+}
+
+// Function to load the OpenAPI file to build the imposter structure
+function loadOpenapi (options, server) {
+    if (options.openapi === undefined) {
+        return Q(true);
+    }
+    // If the openapi flag is passed but the file path is not
+    if (options.openapi === true) {
+        server.log('error', 'Swagger/OpenAPI file not passed');
+        return Q(true);
+    }
+    const SwaggerParser = require('swagger-parser');
+    return SwaggerParser.validate(options.openapi).then(validatedApi => {
+        const fileName = validatedApi.info.title + '.json',
+            imposter = {
+                imposters: {
+                    port: 9090,
+                    protocol: validatedApi.schemes !== undefined ? validatedApi.schemes : 'http',
+                    name: validatedApi.info.title, // OpenAPI required field
+                    stubs: buildStubsStruct(validatedApi)
+                }
+            };
+        fs.writeFileSync(fileName, JSON.stringify(imposter.imposters, null, '\t'));
+        server.log('info', `OpenAPI imposter file created with the name  ${fileName}`);
+        return putConfig(options, JSON.stringify({ imposters: [imposter.imposters] }));
+    }).catch(e => {
+        throw e;
+    });
 }
 
 function serverAt (options) {
@@ -172,6 +322,8 @@ function serverAt (options) {
             process.on('SIGTERM', shutdown);
 
             return loadConfig(options, server);
+        }).then(server => {
+            return loadOpenapi(options, server);
         }).then(() => {
             // Useful for build plugins that need to wait for mb to be fully initialized
             // They can wait for the pidfile to be written
@@ -395,6 +547,12 @@ const aliases = {
             default: false,
             type: 'boolean',
             global: false
+        },
+        openapi: {
+            description: 'openapi file to create imposters and stubs structure',
+            nargs: 1,
+            type: 'string',
+            global: false
         }
     },
     startOptions = {
@@ -413,7 +571,8 @@ const aliases = {
         mock: options.mock,
         debug: options.debug,
         heroku: options.heroku,
-        protofile: options.protofile
+        protofile: options.protofile,
+        openapi: options.openapi
     };
 
 const argv = yargs
