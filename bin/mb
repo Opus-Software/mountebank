@@ -136,7 +136,7 @@ function getContentsOrExit (file, server) {
 var CONFIG_FILE_PATH = null;
 function loadConfig (options, server) {
     if (!shouldLoadConfigFile(options)) {
-        return Q(true);
+        return Q(server);
     }
     CONFIG_FILE_PATH = options.configfile;
     const configContents = getContentsOrExit(options.configfile, server),
@@ -149,7 +149,151 @@ function loadConfig (options, server) {
         // [json] Assume they left off the outer imposters array
         imposters = json.imposters || [json];
 
-    return putConfig(options, JSON.stringify({ imposters: imposters }));
+    return putConfig(options, JSON.stringify({ imposters: imposters })).then(() => {
+        return Q(server);
+    });
+}
+
+// Function that builds the operations results to be used in the response body
+function buildWsdlResponse (res, nsArr) {
+    let line = '';
+    const name = Object.keys(res[0])[0];
+    // If the current result field is a composed one, call the function recursively
+    if (Array.isArray(res[0][name])) {
+        const nextLine = buildWsdlResponse(res[0][name], nsArr);
+        nsArr = nextLine[1];
+        // Add the namespace only if the object is not empty
+        if (Object.entries(res[1]).length === 0) {
+            line += `<${name}>${nextLine[0]}</${name}>`;
+        }
+        else {
+            line += `<${res[1].short}:${name}>${nextLine[0]}</${res[1].short}:${name}>`;
+            nsArr.push(`${res[1].short}=${res[1].full}`);
+        }
+    }
+    else {
+        // Add the result field name and an example according to the field's type to the line string
+        for (const field in res[0]) {
+            // Add the namespace only if the object is not empty
+            if (Object.entries(res[1]).length === 0) {
+                line += `<${field}>${res[0][field]}</${field}>`;
+            }
+            else {
+                line += `<${res[1].short}:${field}>${res[0][field]}</${res[1].short}:${field}>`;
+            }
+        }
+        if (Object.entries(res[1]).length !== 0) {
+            nsArr.push(`${res[1].short}=${res[1].full}`);
+        }
+    }
+    return [line, nsArr];
+}
+
+// Function that generates a default example according to the entry's type
+function getExampleGivenType (type) {
+    switch (type.substring(type.lastIndexOf(':') + 1)) {
+        case 'string':
+            return '?';
+        case 'boolean':
+            return false;
+        case 'dateTime':
+            return '0000-00-00T00:00:00';
+        case 'date':
+            return '0000-00-00';
+        case 'time':
+            return '00:00:00';
+        default:
+            return 0;
+    }
+}
+
+// Function to deal with the input and output objects from the soap module
+function treatOperationObject (obj) {
+    // Object to store the found namespaces
+    const ns = {};
+    // Object to store the found attributes
+    const values = {};
+    for (const elem in obj) {
+        if (elem === 'targetNSAlias') {
+            ns.short = obj.targetNSAlias;
+        }
+        else if (elem === 'targetNamespace') {
+            ns.full = obj.targetNamespace;
+        }
+        else if (typeof obj[elem] === 'object') {
+            values[elem] = treatOperationObject(obj[elem]);
+        }
+        else {
+            values[elem] = getExampleGivenType(obj[elem]);
+        }
+    }
+    return ([values, ns]);
+}
+
+// Function to load the WSDL url or file to build the imposter structure
+function loadWsdl (options, server) {
+    if (options.wsdl === undefined) {
+        return Q(true);
+    }
+    // If the wsdl flag is passed but the file path or url is not
+    if (options.wsdl === true) {
+        server.log('error', 'WSDL file or url not passed');
+        return Q(true);
+    }
+    const soap = require('soap');
+    let fileName = '';
+    // Make the soap request from the wsdl
+    return soap.createClientAsync(options.wsdl).then(client => {
+        return client.describe();
+    }).then(description => {
+        // The filename is the same as the name of the wsdl service
+        fileName = Object.keys(description)[0];
+        const service = Object.keys(description[fileName])[0];
+        const operations = description[fileName][service];
+        const imposter = {
+            imposters: {
+                port: 9090,
+                protocol: 'http',
+                stubs: []
+            }
+        };
+        for (const op in operations) {
+            const predicates = [];
+            const resps = treatOperationObject(operations[op].output);
+            predicates.push({
+                xpath: {
+                    selector: `//${op}`
+                },
+                exists: {
+                    body: true
+                }
+            });
+            // Build the stubs response from the treated output object
+            const respData = buildWsdlResponse(resps, []);
+            let body = '<soapenv:Envelope';
+            // Add the namespaces to the soap envelope, if there are any
+            respData[1].forEach(ns => {
+                body += ` xmlns:${ns}`;
+            });
+            body += `><soapenv:Header/><soapenv:Body>${respData[0]}</soapenv:Body></soapenv:Envelope>`;
+            // Library to prettify the xml string
+            const vkBeautify = require('vkbeautify');
+            const response = [{
+                is: {
+                    body: vkBeautify.xml(body)
+                }
+            }];
+            imposter.imposters.stubs.push({ predicates: predicates, responses: response });
+        }
+        return imposter;
+    }).then(imposter => {
+        // Write the built imposter structure to a json file
+        fs.writeFileSync(`${fileName}.json`, JSON.stringify(imposter.imposters, null, '\t'));
+        server.log('info', `WSDL imposter file created with the name ${fileName}.json`);
+        return putConfig(options, JSON.stringify({ imposters: [imposter.imposters] }));
+    }).catch(e => {
+        throw e;
+    });
 }
 
 function serverAt (options) {
@@ -172,6 +316,8 @@ function serverAt (options) {
             process.on('SIGTERM', shutdown);
 
             return loadConfig(options, server);
+        }).then(server => {
+            return loadWsdl(options, server);
         }).then(() => {
             // Useful for build plugins that need to wait for mb to be fully initialized
             // They can wait for the pidfile to be written
@@ -395,6 +541,12 @@ const aliases = {
             default: false,
             type: 'boolean',
             global: false
+        },
+        wsdl: {
+            description: 'wsdl url or file to create imposter and stubs structure',
+            nargs: 1,
+            type: 'string',
+            global: false
         }
     },
     startOptions = {
@@ -413,7 +565,8 @@ const aliases = {
         mock: options.mock,
         debug: options.debug,
         heroku: options.heroku,
-        protofile: options.protofile
+        protofile: options.protofile,
+        wsdl: options.wsdl
     };
 
 const argv = yargs

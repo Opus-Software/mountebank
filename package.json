@@ -54,6 +54,8 @@
     "q": "1.5.1",
     "query-string": "6.12.0",
     "smtp-server": "^3.6.0",
+    "soap": "^0.30.0",
+    "vkbeautify": "0.99.3",
     "winston": "3.2.1",
     "xmldom": "0.3.0",
     "xpath": "0.0.27",
