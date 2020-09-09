@@ -62,6 +62,22 @@ function putConfig (options, body) {
     return deferred.promise;
 }
 
+function deleteConfig (options) {
+    const deferred = Q.defer(),
+        requestOptions = {
+            method: 'DELETE',
+            path: '/imposters',
+            port: options.port,
+            hostname: options.host || 'localhost'
+        },
+        request = http.request(requestOptions, response => {
+            deferred.resolve(response);
+        });
+    request.on('error', deferred.reject);
+    request.end();
+    return deferred.promise;
+}
+
 function getConfig (options) {
     const deferred = Q.defer(),
         requestOptions = {
@@ -133,6 +149,26 @@ function getContentsOrExit (file, server) {
     }
 }
 
+// Function that gets all the files that are included in the given configfile
+// and returns them all in an array.
+function getFilesArray (dirPath, contents, server) {
+    const matches = [...contents.matchAll(/<% include (.*?) %>/g)],
+        files = [];
+    matches.forEach(file => {
+        let nextFilePath = dirPath;
+        if (path.dirname(file[1]) !== '.') {
+            nextFilePath += '/' + path.dirname(file[1]);
+        }
+        const nextFile = getContentsOrExit(nextFilePath + '/' + path.basename(file[1]), server);
+        files.push(nextFilePath + '/' + path.basename(file[1]));
+        const includes = getFilesArray(nextFilePath, nextFile, server);
+        if (includes.length > 0) {
+            files.push(includes);
+        }
+    });
+    return files;
+}
+
 var CONFIG_FILE_PATH = null;
 function loadConfig (options, server) {
     if (!shouldLoadConfigFile(options)) {
@@ -149,7 +185,42 @@ function loadConfig (options, server) {
         // [json] Assume they left off the outer imposters array
         imposters = json.imposters || [json];
 
-    return putConfig(options, JSON.stringify({ imposters: imposters }));
+    let fileArray = [];
+    if (options.autoreload) {
+        fileArray = getFilesArray(path.dirname(options.configfile), configContents, server);
+        fileArray.push(options.configfile);
+    }
+    return putConfig(options, JSON.stringify({ imposters: imposters })).then(() => {
+        return [fileArray, server];
+    });
+}
+
+// Functions that watches the given configuration file for changes. If an update
+// is made to the file, the imposters created by the old configfile are deleted
+// and the new configfile is loaded.
+function watchConfig (options, array) {
+    if (!shouldLoadConfigFile(options) || !options.autoreload) {
+        return Q(array);
+    }
+    const fileArray = array[0],
+        server = array[1],
+        watcher = require('chokidar').watch(fileArray);
+    watcher.on('change', changedFile => {
+        server.log('warn', `${changedFile} was changed. Restarting the configuration file...`);
+        return deleteConfig(options).then(() => {
+            return loadConfig(options, server);
+        }).catch(e => {
+            server.log('error', e);
+            throw e;
+        });
+    })
+        .on('unlink', unlinkedFile => {
+            server.log('warn', `${unlinkedFile} was removed or renamed.`);
+        })
+        .on('error', e => {
+            throw e;
+        });
+    return Q(server);
 }
 
 function serverAt (options) {
@@ -172,10 +243,14 @@ function serverAt (options) {
             process.on('SIGTERM', shutdown);
 
             return loadConfig(options, server);
+        }).then(arr => {
+            return watchConfig(options, arr);
         }).then(() => {
             // Useful for build plugins that need to wait for mb to be fully initialized
             // They can wait for the pidfile to be written
             fs.writeFileSync(options.pidfile, process.pid.toString());
+        }).catch(e => {
+            throw e;
         }).done();
     }
 
@@ -395,6 +470,12 @@ const aliases = {
             default: false,
             type: 'boolean',
             global: false
+        },
+        autoreload: {
+            default: false,
+            description: 'set to watch changes in the configuration files',
+            type: 'boolean',
+            global: false
         }
     },
     startOptions = {
@@ -413,7 +494,8 @@ const aliases = {
         mock: options.mock,
         debug: options.debug,
         heroku: options.heroku,
-        protofile: options.protofile
+        protofile: options.protofile,
+        autoreload: options.autoreload
     };
 
 const argv = yargs
