@@ -152,6 +152,11 @@ description = 'Command line parameters for starting mountebank'
     <td>File to load custom <a href='/docs/protocols/custom'>protocol implementations</a> from.</td>
     <td><code>protocols.json</code></td>
   </tr>
+  <tr>
+    <td><code>--wsdl service.wsdl</code></td>
+    <td>If present, mountebank will load the WSDL web service from the file or from the link and build an imposter structure from it.</td>
+    <td><code>N/A</code></td>
+  </tr>
 </table>
 
 <p>Note that <code>mb</code> is not persistent.  Stopping and restarting <code>mb</code>
